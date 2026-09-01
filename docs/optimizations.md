@@ -54,6 +54,20 @@ paged DSA fallback 写成完全向量化（无 `.item()`/python 循环）→ 可
 
 详细调试过程见 [GLM5.3-SM89-优化报告.md](../GLM5.3-SM89-优化报告.md)。
 
+### 进行中 / 待验证的优化
+
+以下改动已落地代码，需在 8×4090 服务器上实测确认收益：
+
+| 项 | 类型 | 说明 | 状态 |
+|----|------|------|------|
+| prefill DSA logits 按 M 分块 | 代码 | `_sm89_torch_ref_mqa_logits` 原本一次性 materialize `[H,M,N]` fp32 score（M=N=4096 时约 2 GiB），改为按 512 行分块、循环内 reduce over H，峰值降到约 256 MiB。数学等价，附 CPU 自检 `tests/kernels/attention/test_sm89_dsa_logits.py` | ✅ 已改，待实测 prefill 提速 |
+| `--moe-backend` 核查 | 配置 | GLM-5.3 是 native FP8 MoE，当前启动脚本用 `marlin`（W4A16 GPTQ 专用），应改 `triton` 或 auto | ⏳ 服务器侧待试 |
+| `VLLM_USE_BREAKABLE_CUDAGRAPH=1` | 配置 | 34 个 KDA 层现走 eager；breakable 图模式可把 `_forward` 当 eager segment、capture 前后投影，若 recurrent kernel 可 capture 则 decode 提速 | ⏳ 服务器侧待试 |
+
+**已排除**：MLA decode 换 SDPA/FlashAttention-2 —— MLA head_dim=512/576 超过 FA2 的 256 上限，内核吃不下，故 vLLM 才需专门的 FlashMLA。此路不通。
+
+**待 re-profile**：196 ms/token 的 IPC 瓶颈是在 5.1 tok/s 配置下测的；7.16 tok/s 时驻留权重更多，瓶颈画像可能已变，需重新 py-spy 后再定后续方向。
+
 ---
 
 ## Qwen3.8-Flash-Next

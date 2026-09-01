@@ -514,6 +514,9 @@ def transform_sf_into_required_layout(*args, **kwargs):
 
 
 # === SM89 DIAG: torch reference for fp8 mqa logits ===
+_SM89_MQA_M_CHUNK = 512
+
+
 def _sm89_torch_ref_mqa_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke):
     import torch
     q_values, q_scale = q
@@ -523,8 +526,17 @@ def _sm89_torch_ref_mqa_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke):
         q_f = q_f * q_scale.float().unsqueeze(-1)
     N = k_quant.shape[0]
     k_f = k_quant.float() * k_scale.float().view(N, 1)
-    score = torch.einsum("mhd,nd->hmn", q_f, k_f)
-    logits = (score.relu() * weights.float().unsqueeze(-1).transpose(0, 1)).sum(0)
+    M = q_f.shape[0]
+    # Tile over query dim: the full [H, M, N] score tensor is ~2 GiB at
+    # M=N=4096, H=32 and dominates prefill. Chunking caps peak at
+    # H*chunk*N*4 (~256 MiB) with identical math — reduce over H inside the
+    # loop instead of materializing every head's scores at once.
+    logits = q_f.new_empty((M, N))
+    w = weights.float()
+    for s in range(0, M, _SM89_MQA_M_CHUNK):
+        e = min(s + _SM89_MQA_M_CHUNK, M)
+        sc = torch.einsum("mhd,nd->mhn", q_f[s:e], k_f)
+        logits[s:e] = (sc.relu() * w[s:e].unsqueeze(-1)).sum(1)
     idx = torch.arange(N, device=logits.device)
     mask = (idx[None, :] >= cu_seqlen_ks[:, None]) & (idx[None, :] < cu_seqlen_ke[:, None])
     return logits.masked_fill(~mask, float("-inf"))

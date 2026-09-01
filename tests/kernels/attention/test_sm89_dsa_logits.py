@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""sm89 DSA prefill logits: tiled path must equal the naive full einsum.
+
+CPU-only, no GPU needed. Guards the M-chunk loop transformation in
+vllm.utils.deep_gemm._sm89_torch_ref_mqa_logits.
+"""
+import torch
+
+from vllm.utils.deep_gemm import _sm89_torch_ref_mqa_logits
+
+
+def _naive(q_f, k_f, weights, ks, ke):
+    N = k_f.shape[0]
+    score = torch.einsum("mhd,nd->hmn", q_f, k_f)
+    logits = (score.relu() * weights.unsqueeze(-1).transpose(0, 1)).sum(0)
+    idx = torch.arange(N)
+    mask = (idx[None, :] >= ks[:, None]) & (idx[None, :] < ke[:, None])
+    return logits.masked_fill(~mask, float("-inf"))
+
+
+def test_tiled_matches_naive():
+    torch.manual_seed(0)
+    M, H, D, N = 1300, 8, 64, 900  # M spans several 512-chunks
+    q = torch.randn(M, H, D)
+    k = torch.randn(N, D)
+    kscale = torch.rand(N) + 0.5
+    weights = torch.rand(M, H)
+    ks = torch.randint(0, N // 2, (M,), dtype=torch.int32)
+    ke = torch.randint(N // 2, N, (M,), dtype=torch.int32)
+
+    got = _sm89_torch_ref_mqa_logits((q, None), (k, kscale), weights, ks, ke)
+    want = _naive(q, k * kscale.view(N, 1), weights, ks, ke)
+
+    finite = torch.isfinite(want)
+    assert torch.equal(got.isfinite(), finite)
+    assert torch.allclose(got[finite], want[finite], atol=1e-4, rtol=1e-4)
+
+
+if __name__ == "__main__":
+    test_tiled_matches_naive()
+    print("ok")
