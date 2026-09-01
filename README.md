@@ -8,10 +8,10 @@
 
 ## 已支持（相对上游的增量）
 
-| 模型 | 显卡 / sm | 状态 |
-|------|-----------|------|
-| GLM-5.3-Flash | RTX 4090 (sm_89) | ✅ 跑通 + 内核优化 |
-| Qwen3.8-Flash-Next | — | ✅ 适配 |
+| 模型 | 显卡 / sm | 状态 | 详情 |
+|------|-----------|------|------|
+| GLM-5.3-Flash | RTX 4090 (sm_89) | ✅ 跑通 + 内核优化 | [优化报告 →](docs/optimizations.md#glm-53-flash--rtx-4090-sm_89) |
+| Qwen3.8-Flash-Next | — | ✅ 适配 | [详情 →](docs/optimizations.md#qwen38-flash-next) |
 
 ---
 
