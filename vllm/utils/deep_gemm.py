@@ -526,13 +526,26 @@ def _sm89_torch_ref_mqa_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke):
         q_f = q_f * q_scale.float().unsqueeze(-1)
     N = k_quant.shape[0]
     k_f = k_quant.float() * k_scale.float().view(N, 1)
+    w = weights.float()
+
+    # Fused Triton path: single pass, no [H, M, N] score in HBM. Falls back to
+    # the torch tiling below on CPU or oversized head dim.
+    try:
+        from vllm.utils.sm89_dsa_triton import (
+            can_use_triton_mqa_logits,
+            triton_mqa_logits,
+        )
+        if can_use_triton_mqa_logits(q_f):
+            return triton_mqa_logits(q_f, k_f, w, cu_seqlen_ks, cu_seqlen_ke)
+    except Exception:
+        pass
+
     M = q_f.shape[0]
     # Tile over query dim: the full [H, M, N] score tensor is ~2 GiB at
     # M=N=4096, H=32 and dominates prefill. Chunking caps peak at
     # H*chunk*N*4 (~256 MiB) with identical math — reduce over H inside the
     # loop instead of materializing every head's scores at once.
     logits = q_f.new_empty((M, N))
-    w = weights.float()
     for s in range(0, M, _SM89_MQA_M_CHUNK):
         e = min(s + _SM89_MQA_M_CHUNK, M)
         sc = torch.einsum("mhd,nd->mhn", q_f[s:e], k_f)
