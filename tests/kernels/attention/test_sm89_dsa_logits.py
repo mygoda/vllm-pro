@@ -39,7 +39,8 @@ def test_tiled_matches_naive():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="triton path needs GPU")
-def test_triton_matches_naive():
+@pytest.mark.parametrize("bf16", [False, True])
+def test_triton_matches_naive(bf16):
     from vllm.utils.sm89_dsa_triton import triton_mqa_logits
 
     torch.manual_seed(0)
@@ -52,12 +53,22 @@ def test_triton_matches_naive():
     ks = torch.randint(0, N // 2, (M,), dtype=torch.int32, device=dev)
     ke = torch.randint(N // 2, N, (M,), dtype=torch.int32, device=dev)
 
-    got = triton_mqa_logits(q, k * kscale.view(N, 1), weights, ks, ke)
-    want = _naive(q, k * kscale.view(N, 1), weights, ks, ke)
+    k_f = k * kscale.view(N, 1)
+    got = triton_mqa_logits(q, k_f, weights, ks, ke, bf16_dot=bf16)
+    want = _naive(q, k_f, weights, ks, ke)
 
     finite = torch.isfinite(want)
     assert torch.equal(got.isfinite(), finite)
-    assert torch.allclose(got[finite], want[finite], atol=1e-3, rtol=1e-3)
+    if not bf16:
+        assert torch.allclose(got[finite], want[finite], atol=1e-3, rtol=1e-3)
+    else:
+        # bf16 shifts absolute values; what matters is the topk ranking that
+        # feeds index selection. Require high overlap of the top-64 per row.
+        kk = 64
+        gi = got.masked_fill(~got.isfinite(), float("-inf")).topk(kk, -1).indices
+        wi = want.masked_fill(~want.isfinite(), float("-inf")).topk(kk, -1).indices
+        overlap = (gi.sort(-1).values == wi.sort(-1).values).float().mean()
+        assert overlap > 0.95
 
 
 if __name__ == "__main__":
