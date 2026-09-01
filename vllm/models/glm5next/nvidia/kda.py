@@ -546,6 +546,34 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 safe_gate=safe_gate,
                 lower_bound=lower_bound,
             )
+            import os as _os
+            if _os.environ.get("SM89_KDACMP") == "1":
+                try:
+                    import torch as _t
+                    _rc_out, _ = fused_recurrent_kda(
+                        q=_rearr(q_ns),
+                        k=_rearr(k_ns),
+                        v=_rearr(v_ns),
+                        g=g1_ns,
+                        beta=beta_ns,
+                        initial_state=initial_state,
+                        use_qk_l2norm_in_kernel=True,
+                        cu_seqlens=non_spec_query_start_loc,
+                        sigmoid_beta=True,
+                        a_log=self.A_log,
+                        g_bias=self.dt_bias,
+                        compute_gate=True,
+                        lower_bound=lower_bound,
+                    )
+                    _a = core_attn_out_non_spec.float()
+                    _b = _rc_out.float().reshape(_a.shape)
+                    _md = (_a - _b).abs().max().item()
+                    _rel = ((_a - _b).norm() / (_a.norm() + 1e-6)).item()
+                    with open("/root/sm89dbg.txt", "a") as _fh:
+                        _fh.write(f"KDACMP chunk_vs_recurrent maxdiff={_md:.4f} rel={_rel:.4f} out_n={_a.norm().item():.2f} T={q_ns.shape}"+chr(10))
+                except Exception as _e:
+                    with open("/root/sm89dbg.txt", "a") as _fh:
+                        _fh.write(f"KDACMP err {type(_e).__name__}: {_e}"+chr(10))
             # Init cache
             scatter_states(
                 recurrent_state,

@@ -141,6 +141,8 @@ def _get_backend_priorities(
             flashinfer_sparse = AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM90
             if head_size == 512:
                 sparse_tail.insert(0, flashinfer_sparse)
+                # sm89: portable torch-ref sparse-MLA (gather+einsum), correct any-arch
+                sparse_tail.insert(0, AttentionBackendEnum.TORCHREF_MLA_SPARSE_SM89)
             else:
                 sparse_tail.append(flashinfer_sparse)
             return [

@@ -18,7 +18,16 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+
+def _sm89_guarded_paged_mqa_meta(*a, **k):
+    try:
+        from vllm.utils.deep_gemm import get_paged_mqa_logits_metadata as _g
+        return _g(*a, **k)
+    except Exception:
+        return None
+
 from vllm.utils.deep_gemm import (
+    is_deep_gemm_supported,
     get_paged_mqa_logits_metadata,
     has_deep_gemm,
     native_next_n_supported,
@@ -582,7 +591,7 @@ def _supports_varlen_paged_mqa_logits() -> bool:
     return (
         current_platform.is_cuda()
         and current_platform.is_device_capability_family(100)
-        and has_deep_gemm()
+        and is_deep_gemm_supported()
     )
 
 
@@ -590,7 +599,7 @@ def _supports_flattened_device_query_lens() -> bool:
     return (
         current_platform.is_cuda()
         and current_platform.is_device_capability_family(90)
-        and has_deep_gemm()
+        and is_deep_gemm_supported()
     )
 
 
@@ -599,7 +608,7 @@ def _supports_native_decode(next_n: int) -> bool:
     instead of flattening to one single-token row per query, which re-reads
     the KV tile once per row.
     """
-    if not (current_platform.is_cuda() and has_deep_gemm()):
+    if not (current_platform.is_cuda() and is_deep_gemm_supported()):
         return next_n in (1, 2)
     if current_platform.is_device_capability_family(100):
         return True
@@ -1192,15 +1201,16 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
             # DeepGEMM is required for the paged MQA logits on CUDA devices
             schedule_metadata = self.scheduler_metadata_buffer
-            if current_platform.is_cuda() and has_deep_gemm():
-                metadata = get_paged_mqa_logits_metadata(
+            if current_platform.is_cuda() and is_deep_gemm_supported():
+                metadata = _sm89_guarded_paged_mqa_meta(
                     seq_lens,
                     self.kv_cache_spec.num_states,
                     self.num_sms,
                     indices=decode_indices,
                 )
-                schedule_metadata = self.scheduler_metadata_buffer[: metadata.shape[0]]
-                schedule_metadata[:] = metadata
+                if metadata is not None:
+                    schedule_metadata = self.scheduler_metadata_buffer[: metadata.shape[0]]
+                    schedule_metadata[:] = metadata
 
             decode_metadata = DeepSeekV32IndexerDecodeMetadata(
                 block_table=block_table,

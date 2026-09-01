@@ -14,6 +14,8 @@ def mhc_pre_torch(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     n_splits: int = 1,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Forward pass for mHC pre block.
@@ -83,7 +85,15 @@ def mhc_pre_torch(
 
     layer_input = torch.sum(
         pre_mix.unsqueeze(-1) * residual_flat.to(torch.float32), dim=1
-    ).to(torch.bfloat16)
+    )
+    if norm_weight is not None:
+        # Fused RMSNorm over hidden dim (fp32 accum) then learned-weight scale,
+        # matching the tilelang big_fuse norm-fused write path. Without this the
+        # per-layer input_layernorm/post_attention_layernorm weights are dropped.
+        _var = layer_input.pow(2).mean(dim=-1, keepdim=True)
+        layer_input = layer_input * torch.rsqrt(_var + norm_eps)
+        layer_input = layer_input * norm_weight.float()
+    layer_input = layer_input.to(torch.bfloat16)
     return (
         post_mix.view(*outer_shape, hc_mult, 1),
         comb_mix.view(*outer_shape, hc_mult, hc_mult),

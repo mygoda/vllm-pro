@@ -512,6 +512,72 @@ def transform_sf_into_required_layout(*args, **kwargs):
     )
 
 
+
+# === SM89 DIAG: torch reference for fp8 mqa logits ===
+def _sm89_torch_ref_mqa_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke):
+    import torch
+    q_values, q_scale = q
+    k_quant, k_scale = kv
+    q_f = q_values.float()
+    if q_scale is not None:
+        q_f = q_f * q_scale.float().unsqueeze(-1)
+    N = k_quant.shape[0]
+    k_f = k_quant.float() * k_scale.float().view(N, 1)
+    score = torch.einsum("mhd,nd->hmn", q_f, k_f)
+    logits = (score.relu() * weights.float().unsqueeze(-1).transpose(0, 1)).sum(0)
+    idx = torch.arange(N, device=logits.device)
+    mask = (idx[None, :] >= cu_seqlen_ks[:, None]) & (idx[None, :] < cu_seqlen_ke[:, None])
+    return logits.masked_fill(~mask, float("-inf"))
+
+
+def _sm89_torch_ref_paged_mqa_logits(q, kv_cache, weights, context_lens, block_tables, max_model_len):
+    """sm89 fallback for deep_gemm fp8_fp4_paged_mqa_logits (Hopper-only).
+
+    Fully vectorized / GPU-only (no .item()/.tolist()/python loops) so it is
+    CUDA-graph-capturable. Decodes the fp8 paged cache
+    [num_blocks, block_size, 1, D+4] uint8 (per (block,pos): D fp8-e4m3 value
+    bytes + 4 fp32 scale bytes) and computes over the full max_model_len window:
+        logits[b*next_n, p] = sum_h relu(q[b,nn,h].k[p]) * weights[b*next_n,h]
+    causal+context masked. Correctness over speed (full-window einsum).
+    """
+    import torch
+    q_values, q_scale = q
+    B, next_n, H, D = q_values.shape
+    q_f = q_values.float()
+    if q_scale is not None:
+        q_f = q_f * q_scale.float()
+    dev = q_f.device
+    nb, bs = kv_cache.shape[0], kv_cache.shape[1]
+    kc_flat = kv_cache.reshape(nb * bs, -1)  # [nb*bs, D+4] uint8
+    P = max_model_len
+    max_blocks = block_tables.shape[1]
+    pos = torch.arange(P, device=dev)
+    blk = (pos // bs).clamp(max=max_blocks - 1)          # [P]
+    off = pos % bs                                       # [P]
+    phys = block_tables[:, blk].long() * bs + off[None, :]   # [B, P]
+    phys = phys.clamp(0, nb * bs - 1)
+    gathered = kc_flat[phys.reshape(-1)].reshape(B, P, -1)   # [B, P, D+4]
+    kf8 = gathered[:, :, :D].contiguous().view(torch.float8_e4m3fn).float()  # [B, P, D]
+    ksc = gathered[:, :, D:D + 4].contiguous().view(torch.float32).reshape(B, P, 1)
+    k_deq = kf8 * ksc                                    # [B, P, D]
+    sc = torch.einsum("bnhd,bpd->bnhp", q_f, k_deq)      # [B, next_n, H, P]
+    w = weights.reshape(B, next_n, H).float()
+    sc = (sc.relu() * w.unsqueeze(-1)).sum(2)            # [B, next_n, P]
+    ctx = context_lens.reshape(B, -1)[:, 0]              # [B]
+    q_pos = ctx[:, None] - next_n + torch.arange(next_n, device=dev)[None, :]   # [B, next_n]
+    keep = (pos[None, None, :] <= q_pos[:, :, None]) & (pos[None, None, :] < ctx[:, None, None])
+    sc = torch.where(keep, sc, torch.full_like(sc, float("-inf")))
+    return sc.reshape(B * next_n, P)
+
+
+def _sm89_diag_log(msg):
+    try:
+        with open("/root/sm89dbg.txt", "a") as fh:
+            fh.write(msg + chr(10))
+    except Exception:
+        pass
+# === end SM89 DIAG ===
+
 def fp8_fp4_mqa_logits(
     q: tuple[torch.Tensor, torch.Tensor | None],
     kv: tuple[torch.Tensor, torch.Tensor],
@@ -545,8 +611,31 @@ def fp8_fp4_mqa_logits(
         Logits tensor of shape [M, N], dtype `torch.float32`.
     """
     _lazy_init()
-    if _fp8_fp4_mqa_logits_impl is None:
+    import os as _os
+    if not is_deep_gemm_supported():
+        return _sm89_torch_ref_mqa_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
+    _diag = _os.environ.get("SM89_DIAG") == "1"
+    _use_ref = _os.environ.get("SM89_TORCH_LOGITS") == "1"
+    if _fp8_fp4_mqa_logits_impl is None and not _use_ref:
         return _missing()
+    if _diag or _use_ref:
+        import torch as _t
+        _ref = _sm89_torch_ref_mqa_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
+        if _diag and _fp8_fp4_mqa_logits_impl is not None:
+            try:
+                _dg = _fp8_fp4_mqa_logits_impl(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits=True)
+                _rf = _ref.clone()
+                _fin = _t.isfinite(_rf) & _t.isfinite(_dg)
+                _md = (_dg[_fin] - _rf[_fin]).abs().max().item() if _fin.any() else -1.0
+                _kk = min(64, _ref.shape[-1])
+                _ti = _ref.topk(_kk, dim=-1).indices
+                _tj = _dg.masked_fill(~_t.isfinite(_dg), float("-inf")).topk(_kk, dim=-1).indices
+                _ov = (_ti.sort(-1).values == _tj.sort(-1).values).float().mean().item()
+                _sm89_diag_log(f"MQA prefill M={_ref.shape[0]} N={_ref.shape[-1]} maxdiff={_md:.4f} topk{_kk}_overlap={_ov:.3f}")
+            except Exception as _e:
+                _sm89_diag_log(f"MQA prefill diag-err {type(_e).__name__}: {_e}")
+        if _use_ref:
+            return _ref
     return _fp8_fp4_mqa_logits_impl(
         q,
         kv,
@@ -600,6 +689,8 @@ def get_paged_mqa_logits_metadata(
         to schedule work across SMs.
     """
     _lazy_init()
+    if not is_deep_gemm_supported():
+        return context_lens.new_zeros((1, 2), dtype=context_lens.dtype)
     if _get_paged_mqa_logits_metadata_impl is None:
         return _missing()
     next_n = context_lens.shape[1] if context_lens.dim() == 2 else 1
@@ -651,6 +742,10 @@ def fp8_fp4_paged_mqa_logits(
         `torch.float32`.
     """
     _lazy_init()
+    if not is_deep_gemm_supported():
+        return _sm89_torch_ref_paged_mqa_logits(
+            q, kv_cache, weights, context_lens, block_tables, max_model_len
+        )
     if _fp8_fp4_paged_mqa_logits_impl is None:
         return _missing()
     # DeepGEMM asserts block_tables.stride(-1)==1. A trailing size-1 dim

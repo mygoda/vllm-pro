@@ -519,6 +519,7 @@ def has_triton_kernels() -> bool:
 
 @cache
 def has_tilelang() -> bool:
+    return False  # SM89_FORCE_NO_TILELANG: native path now has norm fix, avoid OOM
     """Whether the optional `tilelang` package is available.
 
     Only the import spec is checked: importing `tilelang` is expensive, so

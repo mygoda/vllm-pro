@@ -681,10 +681,26 @@ class Glm5NextModel(nn.Module):
         if self.is_sequence_parallel:
             hidden_states = sp_shard(hidden_states)
 
-        for layer in self._active_layers:
+        import os as _os
+        _ldbg = _os.environ.get("SM89_LAYERDBG") == "1"
+        for _li, layer in enumerate(self._active_layers):
             hidden_states, residual, post, comb = layer(
                 positions, hidden_states, residual, post, comb
             )
+            if _ldbg:
+                try:
+                    import torch as _t
+                    _sa = getattr(layer, "self_attn", None)
+                    _ty = type(_sa).__name__ if _sa is not None else "?"
+                    def _st(x):
+                        if x is None: return "None"
+                        xf = x.float()
+                        return f"n={xf.norm().item():.1f} mx={xf.abs().max().item():.1f} nan={int(_t.isnan(xf).any())}"
+                    with open("/root/sm89dbg.txt","a") as _fh:
+                        _fh.write(f"L{self.start_layer+_li:02d} {_ty[:18]:18s} h[{_st(hidden_states)}] r[{_st(residual)}]"+chr(10))
+                except Exception as _e:
+                    with open("/root/sm89dbg.txt","a") as _fh:
+                        _fh.write(f"L{_li} dbg-err {type(_e).__name__}: {_e}"+chr(10))
 
         if not get_pp_group().is_last_rank:
             # PP is gated off for GLM-5.3-Flash (no make_empty_intermediate_tensors),
