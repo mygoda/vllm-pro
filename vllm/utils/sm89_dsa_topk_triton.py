@@ -20,10 +20,6 @@ from vllm.triton_utils import tl, triton
 
 _MAX_N = 16384  # tile is next_pow2(N) int64; beyond this fall back to persistent_topk
 
-# Ascending-sortable float32 bijection (identical to gemma4 routing): larger
-# logit -> smaller key, so an ascending sort puts the largest logits first.
-_MIN32 = -2147483648
-
 
 @triton.jit
 def _topk_row_kernel(
@@ -32,6 +28,9 @@ def _topk_row_kernel(
     stride_lm, stride_om,
     PADDED_N: tl.constexpr,
 ):
+    # Ascending-sortable float32 bijection (identical to gemma4 routing): larger
+    # logit -> smaller key, so an ascending sort puts the largest logits first.
+    MIN32 = -2147483648
     row = tl.program_id(0)
     offs = tl.arange(0, PADDED_N)
     valid = offs < N
@@ -41,7 +40,7 @@ def _topk_row_kernel(
 
     bits = x.to(tl.int32, bitcast=True)
     sign = bits >> 31
-    key = tl.where(sign == 0, bits ^ -1, bits ^ _MIN32)
+    key = tl.where(sign == 0, bits ^ -1, bits ^ MIN32)
     key = tl.where(valid, key, 0x7FFFFFFF)  # out-of-range -> sorts last
     packed = ((key.to(tl.int64) & 0x00000000FFFFFFFF) << 32) | offs.to(tl.int64)
 
@@ -51,7 +50,7 @@ def _topk_row_kernel(
 
     # Inverse bijection to detect -inf (fewer finite scores than topk -> pad -1).
     sk = all_keys >> 31
-    rbits = tl.where(sk < 0, all_keys ^ -1, all_keys ^ _MIN32)
+    rbits = tl.where(sk < 0, all_keys ^ -1, all_keys ^ MIN32)
     rlog = rbits.to(tl.float32, bitcast=True)
     finite = rlog > -float("inf")
 

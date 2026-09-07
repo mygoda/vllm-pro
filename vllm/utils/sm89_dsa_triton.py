@@ -108,7 +108,10 @@ def triton_mqa_logits(
     ke = cu_seqlen_ke.to(torch.int32)
     out = torch.empty((M, N), dtype=torch.float32, device=q_f.device)
 
-    BLOCK_M, BLOCK_N = 64, 128
+    # BLOCK_N=64 (not 128): sm89 has only ~99 KiB shared memory; the k_tile
+    # [BLOCK_D, BLOCK_N] fp32 plus q_tile and acc must fit. 128 needs 128 KiB
+    # and silently falls back to torch.
+    BLOCK_M, BLOCK_N = 64, 64
     BLOCK_D = triton.next_power_of_2(D)
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
     _mqa_logits_kernel[grid](

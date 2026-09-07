@@ -60,12 +60,30 @@ paged DSA fallback 写成完全向量化（无 `.item()`/python 循环）→ 可
 
 | 项 | 类型 | 说明 | 状态 |
 |----|------|------|------|
-| prefill DSA logits 按 M 分块 | 代码 | `_sm89_torch_ref_mqa_logits` 原本一次性 materialize `[H,M,N]` fp32 score（M=N=4096 时约 2 GiB），改为按 512 行分块、循环内 reduce over H，峰值降到约 256 MiB。数学等价，附 CPU 自检 `tests/kernels/attention/test_sm89_dsa_logits.py` | ✅ 已改，待实测 prefill 提速 |
-| prefill DSA logits Triton 融合 kernel | 代码 | `vllm/utils/sm89_dsa_triton.py`：`qk→relu→加权→reduce_h→mask` 融进单 kernel，中间 score 不落 HBM。默认 fp32（`input_precision="ieee"`）匹配参考精度；`VLLM_SM89_DSA_LOGITS_BF16=1` 切 bf16 dot 走 Ada tensor core（fp32 累加），快数倍、精度换 topk 排序（DSA logits 只喂 topk 选择）。GPU 上自动启用，CPU/超大 head dim 回退分块 torch 版 | ✅ 已改，待服务器 A/B |
+| prefill DSA logits 按 M 分块 | 代码 | `_sm89_torch_ref_mqa_logits` 原本一次性 materialize `[H,M,N]` fp32 score（M=N=4096 时约 2 GiB），改为按 512 行分块、循环内 reduce over H，峰值降到约 256 MiB。数学等价，附 CPU 自检 `tests/kernels/attention/test_sm89_dsa_logits.py` | ✅ 真机验证 |
+| prefill DSA logits Triton 融合 kernel | 代码 | `vllm/utils/sm89_dsa_triton.py`：`qk→relu→加权→reduce_h→mask` 融进单 kernel，中间 score 不落 HBM。默认 fp32（`input_precision="ieee"`）匹配参考精度；`VLLM_SM89_DSA_LOGITS_BF16=1` 切 bf16 dot 走 Ada tensor core（fp32 累加）。GPU 自动启用，CPU/超大 head dim 回退分块 torch | ✅ 真机验证，见下表 |
 | `--moe-backend` 核查 | 配置 | GLM-5.3 是 native FP8 MoE，当前启动脚本用 `marlin`（W4A16 GPTQ 专用），应改 `triton` 或 auto | ⏳ 服务器侧待试 |
 | `VLLM_USE_BREAKABLE_CUDAGRAPH=1` | 配置 | 34 个 KDA 层现走 eager；breakable 图模式可把 `_forward` 当 eager segment、capture 前后投影，若 recurrent kernel 可 capture 则 decode 提速 | ⏳ 服务器侧待试 |
 | `--mamba-cache-mode align` | 配置 | **KDA prefix caching 零代码启用** —— vLLM 已内置 `MambaManager` align 模式，默认 `none`。多轮/长系统提示可省整段 KDA prefill。详见 [kda-prefix-cache.md](kda-prefix-cache.md) | ⏳ 服务器侧待试 |
-| topk 寄存器驻留 Triton kernel | 代码 | `vllm/utils/sm89_dsa_topk_triton.py`：借鉴 SGLang topk-v2 的寄存器驻留思路，整行 logits 一次 load 进片上 tile、pack(key,idx)→`tl.sort`→取 top-k（精确，仿 gemma4 routing）。是 `persistent_topk`(v1) 的替代，**待 profile 确认选择步占比后再决定是否接入** | ✅ 已写，待 profile |
+| topk 寄存器驻留 Triton kernel | 代码 | `vllm/utils/sm89_dsa_topk_triton.py`：整行 logits 一次 load 进片上 tile、pack(key,idx)→`tl.sort`→取 top-k（精确）。**真机实测：与 `torch.topk` 打平（0.160 vs 0.158 ms @N=8192），无收益 → 不接入**，留作参考 | ❌ 无收益 |
+
+### 真机实测（8×4090 sm_89，2026-09-07）
+
+**DSA prefill logits kernel**，H=32 D=128（真实 indexer 尺寸），单次耗时：
+
+| 路径 | M=N=4096 | M=N=2048 |
+|------|----------|----------|
+| 原始 `[H,M,N]` 全量 einsum | **OOM**（试图分配 2 GiB） | **OOM** |
+| torch 分块（fallback） | 16.2 ms | 4.07 ms |
+| Triton fp32 | 9.7 ms（1.7×） | 2.35 ms（1.7×） |
+| **Triton bf16** | **0.97 ms（vs 分块 16.7×）** | **0.23 ms（17.4×）** |
+
+**两个真机 bug（仅硬件暴露，numpy 逻辑验证抓不到）**：
+1. topk kernel 的 `_MIN32` 模块全局变量不能在 `@triton.jit` 内访问 → 常量内联进 kernel（照 gemma4）。
+2. logits kernel `BLOCK_N=128` 需 128 KiB shared memory，**超过 sm89 的 ~99 KiB → 每次 OOM 静默 fallback 到 torch 分块**（Triton+bf16 路径在目标硬件上是死代码）。降到 `BLOCK_N=64` 后才真正跑起来，上表数据即修复后。
+
+**结论**：logits Triton bf16 是大赢（分块的 16×）；topk 与 torch.topk 打平不值得接入 —— 印证"先 profile，topk 大概率不是瓶颈"。
+
 
 **已排除**：MLA decode 换 SDPA/FlashAttention-2 —— MLA head_dim=512/576 超过 FA2 的 256 上限，内核吃不下，故 vLLM 才需专门的 FlashMLA。此路不通。
 
