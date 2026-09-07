@@ -64,6 +64,8 @@ paged DSA fallback 写成完全向量化（无 `.item()`/python 循环）→ 可
 | prefill DSA logits Triton 融合 kernel | 代码 | `vllm/utils/sm89_dsa_triton.py`：`qk→relu→加权→reduce_h→mask` 融进单 kernel，中间 score 不落 HBM。默认 fp32（`input_precision="ieee"`）匹配参考精度；`VLLM_SM89_DSA_LOGITS_BF16=1` 切 bf16 dot 走 Ada tensor core（fp32 累加），快数倍、精度换 topk 排序（DSA logits 只喂 topk 选择）。GPU 上自动启用，CPU/超大 head dim 回退分块 torch 版 | ✅ 已改，待服务器 A/B |
 | `--moe-backend` 核查 | 配置 | GLM-5.3 是 native FP8 MoE，当前启动脚本用 `marlin`（W4A16 GPTQ 专用），应改 `triton` 或 auto | ⏳ 服务器侧待试 |
 | `VLLM_USE_BREAKABLE_CUDAGRAPH=1` | 配置 | 34 个 KDA 层现走 eager；breakable 图模式可把 `_forward` 当 eager segment、capture 前后投影，若 recurrent kernel 可 capture 则 decode 提速 | ⏳ 服务器侧待试 |
+| `--mamba-cache-mode align` | 配置 | **KDA prefix caching 零代码启用** —— vLLM 已内置 `MambaManager` align 模式，默认 `none`。多轮/长系统提示可省整段 KDA prefill。详见 [kda-prefix-cache.md](kda-prefix-cache.md) | ⏳ 服务器侧待试 |
+| topk 寄存器驻留 Triton kernel | 代码 | `vllm/utils/sm89_dsa_topk_triton.py`：借鉴 SGLang topk-v2 的寄存器驻留思路，整行 logits 一次 load 进片上 tile、pack(key,idx)→`tl.sort`→取 top-k（精确，仿 gemma4 routing）。是 `persistent_topk`(v1) 的替代，**待 profile 确认选择步占比后再决定是否接入** | ✅ 已写，待 profile |
 
 **已排除**：MLA decode 换 SDPA/FlashAttention-2 —— MLA head_dim=512/576 超过 FA2 的 256 上限，内核吃不下，故 vLLM 才需专门的 FlashMLA。此路不通。
 
