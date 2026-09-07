@@ -84,6 +84,33 @@ paged DSA fallback 写成完全向量化（无 `.item()`/python 循环）→ 可
 
 **结论**：logits Triton bf16 是大赢（分块的 16×）；topk 与 torch.topk 打平不值得接入 —— 印证"先 profile，topk 大概率不是瓶颈"。
 
+### 端到端 TTFT/TPOT 实测 —— 内核不是瓶颈，`max-num-batched-tokens` 才是（8×4090，2026-09-07）
+
+用新代码（Triton logits kernel 真跑）重启 GLM-5.3 端到端跑，唯一随机 prompt（防 prefix cache）测 TTFT：
+
+| 输入 | 基线（含新 kernel） | 说明 |
+|------|--------|------|
+| 992 tok | 7.03 s | |
+| 4076 tok | 28.24 s | |
+| 6966 tok | 48.23 s | TTFT 随输入**线性** ~6.9 ms/tok |
+
+**Triton logits kernel 微基准快 16×，但端到端 TTFT 零改善、TPOT 不变（7.58 tok/s）。** 说明 DSA logits 不是 prefill 瓶颈。
+
+**真瓶颈定位**：TTFT ∝ prefill chunk 数（`输入 / max-num-batched-tokens`），因为 306 GB 权重是 cpu-offload 流式的，**每个 chunk 都重新流一遍全部 offload 权重**。原配置 `--max-num-batched-tokens 256` → 长 prompt 切几十个 chunk。
+
+**修复（零代码）**：`--max-num-batched-tokens 256 → 2048`：
+
+| 输入 | 256（基线） | **2048** | 提速 |
+|------|-----------|---------|------|
+| 992 tok | 7.03 s | **3.49 s** | 2.0× |
+| 4076 tok | 28.24 s | **9.70 s** | 2.9× |
+| 6966 tok | 48.23 s | **15.84 s** | **3.0×** |
+| TPOT | 7.58 tok/s | 7.58 tok/s | 不变 |
+
+**净结论**：长 prompt TTFT **快 3×**，正确性不变，TPOT 不变。代价：2048 在 CUDA graph capture 期间 OOM 警告（`expandable_segments` 恢复），**已贴 4090 天花板，再往 4096 大概率真崩**。这是 TTFT ↔ activation 显存的取舍。
+
+> 最大教训（贯穿本轮）：内核微基准快 ≠ 端到端快。**必须先 profile 定位瓶颈**——DSA logits 快 16× 毫无用处，一个配置项 `max-num-batched-tokens` 才是 TTFT 的 3× 杠杆。
+
 
 **已排除**：MLA decode 换 SDPA/FlashAttention-2 —— MLA head_dim=512/576 超过 FA2 的 256 上限，内核吃不下，故 vLLM 才需专门的 FlashMLA。此路不通。
 
